@@ -2,8 +2,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import ConfusionMatrixDisplay, roc_auc_score
+from sklearn.svm import SVC
 
-from scripts.common import SEED, plot_boundary, poly_svm, save, split_datasets
+from scripts.common import BEST_C_RBF, SEED, plot_boundary, poly_svm, save, split_datasets
 
 K_AUG = 5_000
 N_AUG = 1_000
@@ -11,6 +12,9 @@ SD_LEVELS = {"No noise (σ = 0)": 0.0, "Low SD (σ = 0.1)": 0.1, "High SD (σ = 
 R_SPLIT = 1.5
 SD_SWEEP = np.linspace(0, 1, 11)
 K_SWEEP = 1_000
+THRESHOLD = 0.7
+GAMMA_BONUS = np.logspace(0, 5, 21)
+K_BONUS = 20
 
 
 def augment(X, y, sd, k, n, rng):
@@ -119,6 +123,40 @@ def plot_noise_sweep(best, Xtr, ytr, Xte, yte, rng):
     print("gap:    ", (sweep["model"].mean(1) - sweep["ref"].mean(1)).round(4))
 
 
+def threshold_crossing(acc):
+    # acc falls as γ grows; np.interp needs increasing x, so interpolate log γ on the reversed curve
+    return 10 ** np.interp(THRESHOLD, acc[::-1], np.log10(GAMMA_BONUS)[::-1]) if acc.min() < THRESHOLD else np.nan
+
+
+def bonus_threshold(Xtr, ytr, Xte, yte, rng):
+    sets = {name: augment(Xte, yte, sd, K_BONUS, N_AUG, rng) for name, sd in SD_LEVELS.items()}
+    acc, train_acc, n_sv = {name: [] for name in sets}, [], []
+    for g in GAMMA_BONUS:
+        m = SVC(kernel="rbf", gamma=g, C=BEST_C_RBF).fit(Xtr, ytr)
+        train_acc.append(m.score(Xtr, ytr))
+        n_sv.append(len(m.support_))
+        for name, (Xa, ya) in sets.items():
+            acc[name].append((m.predict(Xa.reshape(-1, 2)).reshape(K_BONUS, N_AUG) == ya).mean())
+    acc = {k: np.array(v) for k, v in acc.items()}
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.plot(GAMMA_BONUS, train_acc, color="tab:blue", ls=":", label="Train accuracy")
+    for (name, a), col in zip(acc.items(), ["0.4", "tab:green", "tab:red"]):
+        ax.plot(GAMMA_BONUS, a, color=col, marker="o", ms=4, label=name)
+        g = threshold_crossing(a)
+        ax.axvline(g, color=col, ls=":", alpha=0.8)
+        ax.plot(g, THRESHOLD, "o", color=col, ms=9, mec="k")
+    ax.axhline(THRESHOLD, color="0.3", lw=1)
+    ax.set(xscale="log", xlabel=f"RBF γ (C = {BEST_C_RBF}), larger = more overfit",
+           ylabel=f"Accuracy (mean over {K_BONUS} augmented sets)",
+           title=f"Model complexity at which accuracy drops below {THRESHOLD:.0%}, per augmentation")
+    ax.legend()
+    save(fig, "q4_bonus_threshold")
+    plt.show()
+    print(pd.DataFrame({"γ": GAMMA_BONUS.round(1), "Train acc": train_acc, "Support vectors": n_sv, **acc}).round(3).to_string(index=False))
+    return pd.DataFrame({"Augmentation": list(acc), f"γ at {THRESHOLD:.0%}": [threshold_crossing(a) for a in acc.values()]}).set_index("Augmentation").round(0)
+
+
 def main():
     Xtr, Xte, ytr, yte = split_datasets()["Circular"]
     best = poly_svm().fit(Xtr, ytr)
@@ -129,6 +167,7 @@ def main():
     plot_distributions(best, Xtr, ytr, aug_metrics)
     plot_confusion_matrices(aug_metrics)
     plot_noise_sweep(best, Xtr, ytr, Xte, yte, rng)
+    print(bonus_threshold(Xtr, ytr, Xte, yte, rng))
 
 
 if __name__ == "__main__":
